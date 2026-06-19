@@ -94,6 +94,12 @@ for batch in loader:
 `len_fn` receives a raw dataset sample before the original `collate_fn` runs.
 It must return a positive integer.
 
+LBA infers whether the wrapped loader uses a map-style dataset or an
+`IterableDataset`. Map-style loaders reuse the original `batch_sampler`;
+iterable loaders reuse `batch_size` and `drop_last`. Iterable loaders must be
+batched (`batch_size` cannot be `None`), because LBA needs groups of raw samples
+before applying the original `collate_fn`.
+
 ## Public API
 
 The package exposes both a short alias and a descriptive class name:

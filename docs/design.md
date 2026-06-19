@@ -32,6 +32,8 @@ max_length_in_batch * batch_size <= max_padded_length
 
 1. wrapper 保存用户原始 `collate_fn`。
 2. 内部 source loader 使用 record collate，把 raw samples 转成 `(sample, length)`。
+   对 map-style dataset，source loader 复用原始 `batch_sampler`；对
+   `IterableDataset`，source loader 复用 `batch_size` 和 `drop_last`。
 3. PyTorch worker 继续负责 dataset 读取、decode、transform 和 `len_fn`。
 4. 主进程为 records 分配 `arrival_id`。
 5. 主进程 planner 维护全局 sample pool。

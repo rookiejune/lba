@@ -3,7 +3,7 @@ import tempfile
 import warnings
 from pathlib import Path
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from lba import LBA
 from lba.config import DEFAULT_PREFETCH_BATCHES
@@ -11,6 +11,14 @@ from lba.config import DEFAULT_PREFETCH_BATCHES
 
 def identity_collate(samples):
     return samples
+
+
+class SequenceIterableDataset(IterableDataset):
+    def __init__(self, samples):
+        self.samples = samples
+
+    def __iter__(self):
+        yield from self.samples
 
 
 class WrapperSkeletonTest(unittest.TestCase):
@@ -71,6 +79,50 @@ class WrapperSkeletonTest(unittest.TestCase):
 
         self.assertEqual([len(batch) for batch in batches], [2, 2])
         self.assertEqual([len(sample) for sample in batches[0]], [5, 5])
+
+    def test_iterates_iterable_dataset(self) -> None:
+        dataset = SequenceIterableDataset(
+            [[0] * 5, [1] * 5, [2] * 4, [3] * 4],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            adapter = LBA(
+                DataLoader(
+                    dataset,
+                    batch_size=2,
+                    collate_fn=identity_collate,
+                ),
+                len_fn=len,
+                max_padded_length=10,
+                max_padding_ratio=0.0,
+                prefetch_batches=0,
+                log_dir=tmpdir,
+            )
+            batches = list(adapter)
+
+        self.assertEqual([len(batch) for batch in batches], [2, 2])
+        self.assertEqual([len(sample) for sample in batches[0]], [5, 5])
+
+    def test_rejects_unbatched_iterable_dataset(self) -> None:
+        dataset = SequenceIterableDataset([[0], [1]])
+
+        with tempfile.TemporaryDirectory() as tmpdir, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            adapter = LBA(
+                DataLoader(
+                    dataset,
+                    batch_size=None,
+                    collate_fn=identity_collate,
+                ),
+                len_fn=len,
+                max_padded_length=10,
+                prefetch_batches=0,
+                log_dir=tmpdir,
+            )
+
+            with self.assertRaisesRegex(ValueError, "batched DataLoader"):
+                list(adapter)
 
     def test_logs_padding_and_planner_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, warnings.catch_warnings():

@@ -5,7 +5,7 @@ from __future__ import annotations
 import operator
 from typing import Any
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from .types import LengthFn, LengthRecord
 
@@ -30,8 +30,40 @@ def build_source_loader(dataloader: DataLoader, len_fn: LengthFn) -> DataLoader:
     """Build a loader that yields lists of LengthRecord."""
 
     collate_fn = RecordCollator(len_fn)
+    if isinstance(dataloader.dataset, IterableDataset):
+        loader_kwargs = _build_iterable_loader_kwargs(dataloader, collate_fn)
+    else:
+        loader_kwargs = _build_map_loader_kwargs(dataloader, collate_fn)
+
+    return DataLoader(dataloader.dataset, **loader_kwargs)
+
+
+def _build_map_loader_kwargs(
+    dataloader: DataLoader, collate_fn: RecordCollator
+) -> dict[str, Any]:
+    loader_kwargs = _build_common_loader_kwargs(dataloader, collate_fn)
+    loader_kwargs["batch_sampler"] = dataloader.batch_sampler
+    return loader_kwargs
+
+
+def _build_iterable_loader_kwargs(
+    dataloader: DataLoader, collate_fn: RecordCollator
+) -> dict[str, Any]:
+    if dataloader.batch_size is None:
+        raise ValueError(
+            "LBA requires a batched DataLoader when wrapping an IterableDataset."
+        )
+
+    loader_kwargs = _build_common_loader_kwargs(dataloader, collate_fn)
+    loader_kwargs["batch_size"] = dataloader.batch_size
+    loader_kwargs["drop_last"] = dataloader.drop_last
+    return loader_kwargs
+
+
+def _build_common_loader_kwargs(
+    dataloader: DataLoader, collate_fn: RecordCollator
+) -> dict[str, Any]:
     loader_kwargs: dict[str, Any] = {
-        "batch_sampler": dataloader.batch_sampler,
         "num_workers": dataloader.num_workers,
         "collate_fn": collate_fn,
         "pin_memory": dataloader.pin_memory,
@@ -52,4 +84,4 @@ def build_source_loader(dataloader: DataLoader, len_fn: LengthFn) -> DataLoader:
     if dataloader.pin_memory_device:
         loader_kwargs["pin_memory_device"] = dataloader.pin_memory_device
 
-    return DataLoader(dataloader.dataset, **loader_kwargs)
+    return loader_kwargs
