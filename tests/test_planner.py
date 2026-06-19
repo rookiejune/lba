@@ -1,0 +1,58 @@
+import unittest
+import tempfile
+
+from lba.planner import BatchPlanner
+from lba.types import SampleRecord
+
+
+class PlannerSkeletonTest(unittest.TestCase):
+    def test_rejects_invalid_max_padded_length(self) -> None:
+        with self.assertRaises(ValueError):
+            BatchPlanner(0)
+
+    def test_selects_zero_padding_window(self) -> None:
+        planner = BatchPlanner(max_padded_length=15, max_padding_ratio=0.0)
+        planner.add_records(
+            [
+                SampleRecord("a", 5, 0),
+                SampleRecord("b", 5, 1),
+                SampleRecord("c", 5, 2),
+                SampleRecord("d", 9, 3),
+            ]
+        )
+
+        plan = planner.pop_ready()
+
+        self.assertIsNotNone(plan)
+        self.assertEqual([record.sample for record in plan.records], ["a", "b", "c"])
+        self.assertEqual(plan.padded_length, 15)
+        self.assertEqual(plan.padding_length, 0)
+
+    def test_oversized_sample_is_singleton(self) -> None:
+        planner = BatchPlanner(max_padded_length=10)
+        planner.add_records([SampleRecord("long", 12, 0)])
+
+        plan = planner.pop_ready()
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.reason, "oversized")
+        self.assertEqual([record.sample for record in plan.records], ["long"])
+
+    def test_spills_and_flushes_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            planner = BatchPlanner(max_padded_length=10, max_cache_samples=2, spill_dir=tmpdir)
+            planner.add_records(
+                [
+                    SampleRecord("a", 5, 0),
+                    SampleRecord("b", 5, 1),
+                    SampleRecord("c", 5, 2),
+                ]
+            )
+
+            samples = [sample for plan in planner.flush() for sample in plan.samples]
+
+        self.assertCountEqual(samples, ["a", "b", "c"])
+
+
+if __name__ == "__main__":
+    unittest.main()

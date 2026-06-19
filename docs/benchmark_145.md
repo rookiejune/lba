@@ -1,0 +1,143 @@
+# 145 Benchmark 记录
+
+## 环境
+
+- 机器：`145.pami.group`
+- Python 环境：`py312`
+- PyTorch：`2.9.0+cu128`
+- 代码目录：`~/lba_benchmark_run/lba`
+- 本地结果备份：`lba/outputs/remote_145/`
+
+## 数据集
+
+所有结果都使用原始 `DataLoader` 的 `batch_size=32`。LBA 产出的 batch size
+是动态的，但 `max_padded_length` 的默认推断基于这个原始 batch size。
+
+### Synthetic
+
+脚本内置的 lognormal 长度分布文本数据，用于观察 planner 本身的 CPU 开销和 padding 改善幅度。
+
+### Wikitext-103
+
+145 上已有 HuggingFace 缓存：
+
+```text
+~/.cache/huggingface/hub/datasets--Salesforce--wikitext/
+```
+
+从 Parquet 缓存中抽取了 200k 行非空文本：
+
+```text
+~/lba_benchmark_run/lba/outputs/datasets/wikitext103_train_200k.txt
+```
+
+benchmark 使用 `TextLineDataset` 按 offset 读取文本行，以便覆盖真实文本 IO。
+
+## 指标
+
+每个 run 记录：
+
+- `elapsed_sec`：完整迭代耗时。
+- `time_to_first_batch_sec`：首个 batch 产出耗时。
+- `loader_wait_sec`：消费端等待 `next(loader)` 返回的总时间。
+- `loader_wait_per_batch_sec`：平均每个 batch 的 loader 等待时间。
+- `simulated_gpu_sec`：benchmark 中每个 batch 后模拟 GPU 消费的 sleep 时间。
+- `raw_length_sum`：样本真实长度之和。
+- `padded_length_sum`：batch padding 后总长度，计算为 `max_length * batch_size`。
+- `padding_length_sum`：`padded_length_sum - raw_length_sum`。
+- `padding_ratio`：`padding_length_sum / padded_length_sum`。
+
+## 结果
+
+| dataset | mode | samples | workers | elapsed | padded length | padding ratio |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| synthetic | baseline | 20k | 0 | 0.030s | 4,686,560 | 82.75% |
+| synthetic | LBA | 20k | 0 | 12.10s | 868,573 | 6.94% |
+| wikitext | baseline | 20k | 0 | 0.117s | 5,300,032 | 66.75% |
+| wikitext | LBA | 20k | 0 | 14.94s | 1,832,729 | 3.85% |
+| wikitext | baseline | 20k | 4 | 0.214s | 5,300,032 | 66.75% |
+| wikitext | LBA | 20k | 4 | 15.09s | 1,832,729 | 3.85% |
+| wikitext | baseline | 50k | 4 | 0.393s | 13,284,848 | 67.36% |
+| wikitext | LBA | 50k | 4 | 65.42s | 4,506,741 | 3.80% |
+
+## 结论
+
+LBA 对 padding 的改善非常明显。Wikitext 上，padded length 大约减少 65% 到 66%，padding ratio 从约 67% 降到约 3.8%。
+
+当前瓶颈不是 IO。Wikitext 20k 下，`num_workers=0` 和 `num_workers=4` 的 LBA 耗时几乎一样，说明多进程读取不是限制，主进程 planner 才是主要瓶颈。
+
+当前实现不适合继续直接放大数据规模。50k Wikitext 已经需要约 65 秒，下一步应该先优化 planner，再做更大规模 benchmark。
+
+## 对 Planner 的启示
+
+- 不能在每个 batch 后做高成本全局候选搜索。
+- 需要让 planner 的候选维护接近增量式，而不是反复扫描整个 pool。
+- `max_padding_ratio` 快速提交路径是必要的，但还不够。
+- 需要讨论是否引入长度 bucket、局部窗口索引、候选缓存或更强的早停规则。
+- benchmark 暂时应保留 20k/50k 规模，作为 planner 优化前后的回归数据。
+
+## Prefetch Producer 测试
+
+2026-06-19 在 145 上同步当前代码后，使用 `prefetch_batches` 做了一组测试。结果
+备份在本地 `lba/outputs/remote_145/`。
+
+### Wikitext 20k, simulated GPU 0.02s
+
+这个设置相当于消费端目标约 50 it/s，比第一阶段 `>= 5 it/s` 更严格。
+
+| prefetch | batches | elapsed | loader wait | wait / batch | padding ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | 634 | 31.75s | 19.01s | 29.99ms | 7.04% |
+| 4 | 634 | 19.02s | 3.40s | 5.36ms | 7.04% |
+
+### Wikitext 2k, simulated GPU 0.2s
+
+这个设置对应第一阶段约 5 it/s 的目标。
+
+| prefetch | batches | elapsed | loader wait | wait / batch | padding ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | 77 | 17.13s | 1.71s | 22.24ms | 3.57% |
+| 4 | 77 | 15.52s | 0.11s | 1.37ms | 3.57% |
+
+### 结论
+
+`prefetch_batches=4` 对训练式消费场景有效。对于 5 it/s 目标，平均 loader wait
+约 1.37ms，CPU producer 基本可以被 GPU 消费时间覆盖。
+
+使用 `max_padding_ratio=0.1` 对照复跑时，LBA 为 634 batches、17.82s、padding
+ratio 约 7.04%。这和旧记录中的 941 batches、3.85% 不一致，说明较宽松阈值会让
+planner 更倾向产出更大的次优 batch。
+
+### Planner 阈值原因
+
+这个差异不是 prefetch 引起的。对照中的 planner 快速提交路径使用
+`max_padding_ratio=0.1`，并在满足阈值的候选中优先选择更大的
+`padded_length`。因此 planner 会倾向于把 batch 塞得更满，只要候选 padding
+ratio 不超过 10%，就可能接受一个不是最低 padding 的窗口。
+
+对照测试：
+
+| setting | batches | elapsed | padded length | padding ratio |
+| --- | ---: | ---: | ---: | ---: |
+| current, `max_padding_ratio=0.1` | 634 | 17.82s | 1,895,454 | 7.04% |
+| `max_padding_ratio=0.075` | 646 | 20.13s | 1,866,612 | 5.60% |
+| `max_padding_ratio=0.05` | 666 | 25.11s | 1,833,619 | 3.90% |
+
+`max_padding_ratio=0.05` 的 padded length 和旧记录 `1,832,729` 非常接近，
+说明旧结果更像是更严格的快速提交阈值或更偏向低 padding 的候选选择策略。默认
+`max_padding_ratio` 因此采用 `0.05`。
+
+### `max_padding_ratio=0.05` 队列压力
+
+`max_padding_ratio=0.05` 时，Wikitext 20k no-sim producer 速度约为
+`666 / 25.11s = 26.5 it/s`，因此第一阶段 `>= 5 it/s` 目标足够。
+
+继续用 `prefetch_batches=4` 做消费压力测试：
+
+| simulated GPU | target it/s | elapsed | loader wait | wait / batch | padding ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0.05s | 20 it/s | 34.47s | 0.50s | 0.75ms | 3.90% |
+| 0.02s | 50 it/s | 25.98s | 9.54s | 14.33ms | 3.90% |
+
+结论：`max_padding_ratio=0.05` 对 5 it/s 和 20 it/s 的消费速度都够用；到
+50 it/s 时队列开始明显等 producer，实际吞吐回落到约 25.6 it/s。

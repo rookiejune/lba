@@ -1,0 +1,111 @@
+import unittest
+import tempfile
+import warnings
+from pathlib import Path
+
+from torch.utils.data import DataLoader
+
+from lba import LBA
+from lba.config import DEFAULT_PREFETCH_BATCHES
+
+
+def identity_collate(samples):
+    return samples
+
+
+class WrapperSkeletonTest(unittest.TestCase):
+    def test_constructor_keeps_inputs(self) -> None:
+        dataloader = DataLoader(
+            [[0] * 5, [1] * 5],
+            batch_size=2,
+            collate_fn=identity_collate,
+        )
+
+        def len_fn(sample):
+            return len(sample)
+
+        with tempfile.TemporaryDirectory() as tmpdir, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            adapter = LBA(dataloader, len_fn=len_fn, max_padded_length=128, log_dir=tmpdir)
+
+        self.assertIs(adapter.dataloader, dataloader)
+        self.assertIs(adapter.len_fn, len_fn)
+        self.assertEqual(adapter.max_padded_length, 128)
+        self.assertEqual(adapter.config.prefetch_batches, DEFAULT_PREFETCH_BATCHES)
+
+    def test_iterates_dynamic_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            adapter = LBA(
+                DataLoader(
+                    [[0] * 5, [1] * 5, [2] * 4, [3] * 4],
+                    batch_size=2,
+                    collate_fn=identity_collate,
+                ),
+                len_fn=len,
+                max_padded_length=10,
+                max_padding_ratio=0.0,
+                log_dir=tmpdir,
+            )
+            batches = list(adapter)
+
+        self.assertEqual([len(batch) for batch in batches], [2, 2])
+        self.assertEqual([len(sample) for sample in batches[0]], [5, 5])
+
+    def test_prefetch_iterates_dynamic_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            adapter = LBA(
+                DataLoader(
+                    [[0] * 5, [1] * 5, [2] * 4, [3] * 4],
+                    batch_size=2,
+                    collate_fn=identity_collate,
+                ),
+                len_fn=len,
+                max_padded_length=10,
+                max_padding_ratio=0.0,
+                prefetch_batches=2,
+                log_dir=tmpdir,
+            )
+            batches = list(adapter)
+
+        self.assertEqual([len(batch) for batch in batches], [2, 2])
+        self.assertEqual([len(sample) for sample in batches[0]], [5, 5])
+
+    def test_logs_padding_and_planner_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            adapter = LBA(
+                DataLoader(
+                    [[0] * 5, [1], [2] * 4, [3] * 4],
+                    batch_size=2,
+                    collate_fn=identity_collate,
+                ),
+                len_fn=len,
+                max_padded_length=10,
+                prefetch_batches=0,
+                log_dir=tmpdir,
+            )
+            list(adapter)
+            log_text = Path(adapter.log_path).read_text()
+
+        self.assertIn("LBA summary padding", log_text)
+        self.assertIn("before_padding_ratio=", log_text)
+        self.assertIn("after_padding_ratio=", log_text)
+        self.assertIn("padding_ratio_reduction=", log_text)
+        self.assertIn("LBA summary planner", log_text)
+        self.assertIn("sort_time_seconds=", log_text)
+
+    def test_rejects_negative_prefetch_batches(self) -> None:
+        with self.assertRaises(ValueError), tempfile.TemporaryDirectory() as tmpdir:
+            LBA(
+                DataLoader([[0]], batch_size=1, collate_fn=identity_collate),
+                len_fn=len,
+                max_padded_length=10,
+                prefetch_batches=-1,
+                log_dir=tmpdir,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
