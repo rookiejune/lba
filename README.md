@@ -134,9 +134,24 @@ loader = LBA(
 | `warmup_batches` | Number of original dataloader batches used for length-budget inference. Defaults to `min(batch_size, 32)` when possible, otherwise `1`. |
 | `max_cache_samples` | Maximum in-memory planner pool size before spilling old records to disk. |
 | `max_padding_ratio` | Padding threshold used when deciding whether a candidate batch is ready. Default is `0.05`. |
-| `prefetch_batches` | Bounded background queue depth. Set to `0` for fully synchronous iteration. |
+| `prefetch_batches` | Bounded background queue depth. Set to `0` for fully synchronous iteration. Disabled automatically when `torch.distributed` is initialized. |
 | `spill_dir` | Directory for planner spill shards. If omitted, LBA uses a temporary directory. |
 | `log_dir` | Directory for per-run logs. If omitted, logs are written under `~/.lba/logs/`. |
+
+## Distributed Training
+
+When `torch.distributed` is initialized, LBA keeps the steady-state path close
+to normal iteration: each rank emits one planned batch after each source
+`DataLoader` batch. At the final flush, ranks gather their remaining records into
+a shared metadata pool, replan that pool, and distribute the flush batches so
+every rank performs the same number of DDP steps. Map-style datasets exchange
+only `(sample_index, length)` metadata for this flush path; records without
+stable indices fall back to object gathering.
+
+Use source loaders that yield the same number of batches on every rank, such as
+map-style datasets with `DistributedSampler`. Explicit `max_padded_length`
+values must match on every rank; inferred budgets are synchronized with the
+maximum inferred value.
 
 ## Logs
 

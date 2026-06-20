@@ -45,6 +45,13 @@ class SpillStore:
             with shard_path.open("rb") as file:
                 yield pickle.load(file)
 
+    def drain_shards(self) -> Iterator[list[SampleRecord]]:
+        shard_paths = list(self._shard_paths)
+        self._shard_paths.clear()
+        for shard_path in shard_paths:
+            with shard_path.open("rb") as file:
+                yield pickle.load(file)
+
     @property
     def has_shards(self) -> bool:
         return bool(self._shard_paths)

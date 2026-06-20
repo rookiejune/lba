@@ -12,14 +12,31 @@ from .types import BatchPlan, LengthRecord
 class PaddingStats:
     """Aggregate padding ratios across a sequence of batches."""
 
+    # Number of non-empty batches included in this aggregate.
     batch_count: int = 0
+
+    # Number of raw samples represented by those batches.
     sample_count: int = 0
+
+    # Sum of effective sample lengths before padding.
     raw_length_sum: int = 0
+
+    # Sum of padded token slots, computed as max_length * batch_size per batch.
     padded_length_sum: int = 0
+
+    # Sum of padded token slots that do not correspond to raw sample content.
     padding_length_sum: int = 0
+
+    # Sum of per-batch padding ratios, used for the arithmetic mean.
     batch_padding_ratio_sum: float = 0.0
+
+    # Number of emitted LBA batches created by the normal planner path.
     planned_batch_count: int = 0
+
+    # Number of singleton batches emitted because one sample exceeded the budget.
     oversized_batch_count: int = 0
+
+    # Catch-all for future or custom plan reasons.
     other_batch_count: int = 0
 
     def add_lengths(self, lengths: Iterable[int]) -> None:

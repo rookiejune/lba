@@ -3,11 +3,29 @@
 from __future__ import annotations
 
 import operator
+from dataclasses import dataclass
 from typing import Any
 
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 from .types import LengthFn, LengthRecord
+
+
+@dataclass(frozen=True)
+class IndexedSample:
+    index: int
+    sample: Any
+
+
+class IndexedSampleDataset(Dataset):
+    def __init__(self, dataset: Dataset) -> None:
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> IndexedSample:
+        return IndexedSample(index=index, sample=self.dataset[index])
 
 
 class RecordCollator:
@@ -19,10 +37,22 @@ class RecordCollator:
     def __call__(self, samples: list[Any]) -> list[LengthRecord]:
         length_records: list[LengthRecord] = []
         for sample in samples:
-            sample_length = operator.index(self.len_fn(sample))
+            raw_sample = sample
+            sample_index: int | None = None
+            if isinstance(sample, IndexedSample):
+                raw_sample = sample.sample
+                sample_index = sample.index
+
+            sample_length = operator.index(self.len_fn(raw_sample))
             if sample_length <= 0:
                 raise ValueError("len_fn must return a positive integer.")
-            length_records.append(LengthRecord(sample=sample, length=sample_length))
+            length_records.append(
+                LengthRecord(
+                    sample=raw_sample,
+                    length=sample_length,
+                    index=sample_index,
+                )
+            )
         return length_records
 
 
@@ -35,7 +65,10 @@ def build_source_loader(dataloader: DataLoader, len_fn: LengthFn) -> DataLoader:
     else:
         loader_kwargs = _build_map_loader_kwargs(dataloader, collate_fn)
 
-    return DataLoader(dataloader.dataset, **loader_kwargs)
+    dataset = dataloader.dataset
+    if not isinstance(dataset, IterableDataset):
+        dataset = IndexedSampleDataset(dataset)
+    return DataLoader(dataset, **loader_kwargs)
 
 
 def _build_map_loader_kwargs(

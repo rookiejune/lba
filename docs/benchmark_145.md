@@ -5,7 +5,7 @@
 - 机器：`145.pami.group`
 - Python 环境：`py312`
 - PyTorch：`2.9.0+cu128`
-- 代码目录：`~/lba_benchmark_run/lba`
+- 代码目录：早期单进程记录使用 `~/lba_benchmark_run/lba`，DDP 复测使用 `~/repos/lba`
 - 本地结果备份：`lba/outputs/remote_145/`
 
 ## 数据集
@@ -141,3 +141,38 @@ ratio 不超过 10%，就可能接受一个不是最低 padding 的窗口。
 
 结论：`max_padding_ratio=0.05` 对 5 it/s 和 20 it/s 的消费速度都够用；到
 50 it/s 时队列开始明显等 producer，实际吞吐回落到约 25.6 it/s。
+
+## DDP 真实文本测试
+
+DDP benchmark 已支持 `text-file` 数据源，可以直接复用 145 上落盘的 Wikitext
+文本缓存，避免多进程 benchmark 每次重复走 HuggingFace dataset 构建。
+
+参考命令：
+
+```bash
+/home/zhuyin/anaconda3/envs/py312/bin/torchrun --nproc_per_node=2 \
+  benchmarks/ddp_benchmark.py \
+  --dataset text-file \
+  --text-file /home/zhuyin/lba_benchmark_run/lba/outputs/datasets/wikitext103_train_200k.txt \
+  --size 2000 \
+  --batch-size 32 \
+  --num-workers 4 \
+  --max-padded-length 4096 \
+  --max-padding-ratio 0.05 \
+  --compute-iters 0 \
+  --simulate-step-sec 0.2 \
+  --output outputs/ddp_benchmark_2gpu_wikitext2k_textfile_sim02_mpl4096_mpr05.csv
+```
+
+`simulate-step-sec=0.2` 对应约 5 it/s 的训练消费速度。
+
+| mode | samples | batches | steps/rank | elapsed | loader wait sum | padded length | padding ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline | 2,000 | 64 | 32 | 6.75s | 0.08s | 576,160 | 66.53% |
+| LBA | 2,000 | 136 | 68 | 14.76s | 2.06s | 198,756 | 2.98% |
+
+这个结果说明：在 5 it/s 的固定 batch 消费模型下，LBA 的 padded length 下降约
+65.5%，但因为严格 padding 阈值会切出更多 batch，总步数从每 rank 32 步增加到
+68 步，elapsed 也随之增加。这个 benchmark 主要用于确认 DDP 步数对齐、loader
+等待和 padding 改善；真实训练吞吐还需要结合模型的 token 计算成本和梯度累积策略
+一起看。

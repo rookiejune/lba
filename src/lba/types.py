@@ -16,6 +16,7 @@ class LengthRecord:
 
     sample: Any
     length: int
+    index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class SampleRecord:
     sample: Any
     length: int
     arrival_id: int
+    index: int | None = None
 
 
 @dataclass(frozen=True)

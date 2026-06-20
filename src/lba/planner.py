@@ -92,6 +92,18 @@ class BatchPlanner:
                     break
                 yield plan
 
+    def drain_records(self) -> list[SampleRecord]:
+        records = list(self._sorted_records)
+        self._sorted_records = []
+        self._prefix_lengths = [0]
+        self._prefix_needs_refresh = False
+        self._recent_arrival_ids.clear()
+
+        for shard in self.spill_store.drain_shards():
+            records.extend(shard)
+
+        return sorted(records, key=lambda record: record.arrival_id)
+
     def close(self) -> None:
         self.spill_store.cleanup()
 

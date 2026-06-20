@@ -53,6 +53,29 @@ class PlannerSkeletonTest(unittest.TestCase):
 
         self.assertCountEqual(samples, ["a", "b", "c"])
 
+    def test_drains_records_from_memory_and_spill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            planner = BatchPlanner(
+                max_padded_length=10,
+                max_cache_samples=2,
+                spill_dir=tmpdir,
+            )
+            planner.add_records(
+                [
+                    SampleRecord("a", 5, 0),
+                    SampleRecord("b", 5, 1),
+                    SampleRecord("c", 5, 2),
+                ]
+            )
+
+            drained_samples = [record.sample for record in planner.drain_records()]
+            flushed_samples = [
+                sample for plan in planner.flush() for sample in plan.samples
+            ]
+
+        self.assertEqual(drained_samples, ["a", "b", "c"])
+        self.assertEqual(flushed_samples, [])
+
 
 if __name__ == "__main__":
     unittest.main()

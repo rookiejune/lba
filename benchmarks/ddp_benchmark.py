@@ -1,0 +1,422 @@
+"""Distributed benchmark for baseline DataLoader vs LBA."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import random
+import time
+import warnings
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.distributed as dist
+from torch import nn
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+
+from lba import LBA
+from lba.config import DEFAULT_PREFETCH_BATCHES
+
+
+class SyntheticLengthDataset(Dataset[int]):
+    def __init__(self, size: int, seed: int, max_length: int) -> None:
+        rng = random.Random(seed)
+        self.lengths = [
+            min(max_length, max(1, int(rng.lognormvariate(3.2, 1.0))))
+            for _ in range(size)
+        ]
+
+    def __len__(self) -> int:
+        return len(self.lengths)
+
+    def __getitem__(self, index: int) -> int:
+        return self.lengths[index]
+
+
+class HuggingFaceTextDataset(Dataset[str]):
+    def __init__(
+        self,
+        name: str,
+        config: str | None,
+        split: str,
+        text_field: str,
+        limit: int,
+    ) -> None:
+        from datasets import load_dataset
+
+        dataset = load_dataset(name, config, split=split)
+        texts: list[str] = []
+        for row in dataset:
+            text = str(row[text_field]).strip()
+            if not text:
+                continue
+            texts.append(text)
+            if len(texts) >= limit:
+                break
+        self.texts = texts
+
+    def __len__(self) -> int:
+        return len(self.texts)
+
+    def __getitem__(self, index: int) -> str:
+        return self.texts[index]
+
+
+class TextLineDataset(Dataset[str]):
+    def __init__(self, path: Path, limit: int | None) -> None:
+        self.path = path
+        self.offsets: list[int] = []
+        self._file = None
+
+        with path.open("rb") as file:
+            while True:
+                offset = file.tell()
+                line = file.readline()
+                if not line:
+                    break
+                if line.strip():
+                    self.offsets.append(offset)
+                    if limit is not None and len(self.offsets) >= limit:
+                        break
+
+    def __len__(self) -> int:
+        return len(self.offsets)
+
+    def __getitem__(self, index: int) -> str:
+        if self._file is None:
+            self._file = self.path.open("rb")
+        self._file.seek(self.offsets[index])
+        return self._file.readline().decode("utf-8", errors="replace")
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_file"] = None
+        return state
+
+
+class TokenWorkModel(nn.Module):
+    def __init__(self, compute_iters: int) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(1.0))
+        self.compute_iters = compute_iters
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        values = tokens
+        for _ in range(self.compute_iters):
+            values = values * self.scale
+        return values.mean() * self.scale
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    name: str
+    dataset: str
+    world_size: int
+    dataset_size: int
+    batch_size: int
+    num_workers: int
+    max_padded_length: int | None
+    compute_iters: int
+    simulate_step_sec: float
+    elapsed_sec: float
+    time_to_first_batch_sec: float
+    loader_wait_sec_sum: float
+    step_compute_sec_sum: float
+    samples: int
+    batches: int
+    steps_per_rank: float
+    mean_batch_size: float
+    samples_per_sec: float
+    raw_tokens_per_sec: float
+    padded_tokens_per_sec: float
+    raw_length_sum: int
+    padded_length_sum: int
+    padding_length_sum: int
+    padding_ratio: float
+
+
+def sample_length(sample: Any) -> int:
+    if isinstance(sample, int):
+        return sample
+    if isinstance(sample, str):
+        return max(1, len(sample.split()))
+    raise TypeError(f"Unsupported sample type: {type(sample)!r}")
+
+
+def metric_collate(samples: list[Any]) -> dict[str, Any]:
+    lengths = [sample_length(sample) for sample in samples]
+    max_length = max(lengths)
+    raw_length = sum(lengths)
+    padded_length = max_length * len(samples)
+    return {
+        "samples": len(samples),
+        "raw_length": raw_length,
+        "padded_length": padded_length,
+        "padding_length": padded_length - raw_length,
+        "tokens": torch.ones((len(samples), max_length), dtype=torch.float32),
+    }
+
+
+def build_loader(
+    name: str,
+    dataset: Dataset,
+    args: argparse.Namespace,
+) -> Any:
+    sampler = DistributedSampler(dataset, shuffle=False, drop_last=False)
+    source_loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        collate_fn=metric_collate,
+        pin_memory=args.pin_memory,
+    )
+    if name == "baseline":
+        return source_loader
+    if name == "lba":
+        return LBA(
+            source_loader,
+            len_fn=sample_length,
+            max_padded_length=args.max_padded_length,
+            warmup_batches=args.warmup_batches,
+            max_cache_samples=args.max_cache_samples,
+            max_padding_ratio=args.max_padding_ratio,
+            prefetch_batches=args.prefetch_batches,
+            log_dir=args.log_dir,
+        )
+    raise ValueError(f"Unknown loader name: {name}")
+
+
+def run_loader(
+    name: str,
+    dataset_name: str,
+    dataset_size: int,
+    loader: Any,
+    model: DistributedDataParallel,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> BenchmarkResult | None:
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    dist.barrier()
+    torch.cuda.synchronize(device)
+
+    start = time.perf_counter()
+    first_batch_time: float | None = None
+    loader_wait_sec = 0.0
+    step_compute_sec = 0.0
+    samples = 0
+    batches = 0
+    raw_length_sum = 0
+    padded_length_sum = 0
+    padding_length_sum = 0
+
+    iterator = iter(loader)
+    while True:
+        wait_start = time.perf_counter()
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            break
+        wait_end = time.perf_counter()
+        loader_wait_sec += wait_end - wait_start
+        if first_batch_time is None:
+            first_batch_time = wait_end - start
+
+        tokens = batch["tokens"].to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        loss = model(tokens)
+        loss.backward()
+        optimizer.step()
+        torch.cuda.synchronize(device)
+        if args.simulate_step_sec > 0:
+            time.sleep(args.simulate_step_sec)
+        step_compute_sec += time.perf_counter() - wait_end
+
+        batches += 1
+        samples += batch["samples"]
+        raw_length_sum += batch["raw_length"]
+        padded_length_sum += batch["padded_length"]
+        padding_length_sum += batch["padding_length"]
+
+    torch.cuda.synchronize(device)
+    elapsed_sec = time.perf_counter() - start
+
+    sum_values = torch.tensor(
+        [
+            loader_wait_sec,
+            step_compute_sec,
+            float(samples),
+            float(batches),
+            float(raw_length_sum),
+            float(padded_length_sum),
+            float(padding_length_sum),
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+    max_values = torch.tensor(
+        [elapsed_sec, first_batch_time or 0.0],
+        dtype=torch.float64,
+        device=device,
+    )
+    dist.all_reduce(sum_values, op=dist.ReduceOp.SUM)
+    dist.all_reduce(max_values, op=dist.ReduceOp.MAX)
+
+    if rank != 0:
+        return None
+
+    total_samples = int(sum_values[2].item())
+    total_batches = int(sum_values[3].item())
+    total_raw_length = int(sum_values[4].item())
+    total_padded_length = int(sum_values[5].item())
+    total_padding_length = int(sum_values[6].item())
+    max_elapsed = float(max_values[0].item())
+    padding_ratio = (
+        total_padding_length / total_padded_length if total_padded_length else 0.0
+    )
+    return BenchmarkResult(
+        name=name,
+        dataset=dataset_name,
+        world_size=world_size,
+        dataset_size=dataset_size,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        max_padded_length=args.max_padded_length,
+        compute_iters=args.compute_iters,
+        simulate_step_sec=args.simulate_step_sec,
+        elapsed_sec=max_elapsed,
+        time_to_first_batch_sec=float(max_values[1].item()),
+        loader_wait_sec_sum=float(sum_values[0].item()),
+        step_compute_sec_sum=float(sum_values[1].item()),
+        samples=total_samples,
+        batches=total_batches,
+        steps_per_rank=total_batches / world_size if world_size else 0.0,
+        mean_batch_size=total_samples / total_batches if total_batches else 0.0,
+        samples_per_sec=total_samples / max_elapsed if max_elapsed else 0.0,
+        raw_tokens_per_sec=total_raw_length / max_elapsed if max_elapsed else 0.0,
+        padded_tokens_per_sec=(
+            total_padded_length / max_elapsed if max_elapsed else 0.0
+        ),
+        raw_length_sum=total_raw_length,
+        padded_length_sum=total_padded_length,
+        padding_length_sum=total_padding_length,
+        padding_ratio=padding_ratio,
+    )
+
+
+def write_csv(path: Path, rows: list[BenchmarkResult]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(asdict(rows[0]).keys()))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(asdict(row))
+
+
+def build_dataset(args: argparse.Namespace) -> tuple[str, Dataset]:
+    if args.dataset == "synthetic":
+        return (
+            "synthetic",
+            SyntheticLengthDataset(args.size, args.seed, args.max_length),
+        )
+    if args.dataset == "text-file":
+        if args.text_file is None:
+            raise ValueError("--text-file is required for text-file dataset.")
+        path = Path(args.text_file)
+        return path.name, TextLineDataset(path, args.size)
+    if args.dataset == "hf":
+        dataset_name = args.hf_name
+        if args.hf_config is not None:
+            dataset_name = f"{dataset_name}/{args.hf_config}"
+        return (
+            dataset_name,
+            HuggingFaceTextDataset(
+                args.hf_name,
+                args.hf_config,
+                args.hf_split,
+                args.text_field,
+                args.size,
+            ),
+        )
+    raise ValueError(f"Unknown dataset: {args.dataset}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset",
+        choices=["synthetic", "text-file", "hf"],
+        default="synthetic",
+    )
+    parser.add_argument("--text-file")
+    parser.add_argument("--size", type=int, default=20_000)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--hf-name", default="wikitext")
+    parser.add_argument("--hf-config", default="wikitext-2-raw-v1")
+    parser.add_argument("--hf-split", default="train")
+    parser.add_argument("--text-field", default="text")
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--max-padded-length", type=int)
+    parser.add_argument("--warmup-batches", type=int)
+    parser.add_argument("--max-cache-samples", type=int, default=8192)
+    parser.add_argument("--max-padding-ratio", type=float, default=0.05)
+    parser.add_argument("--prefetch-batches", type=int, default=DEFAULT_PREFETCH_BATCHES)
+    parser.add_argument("--compute-iters", type=int, default=4)
+    parser.add_argument("--simulate-step-sec", type=float, default=0.0)
+    parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument("--log-dir", default="outputs/lba_logs")
+    parser.add_argument("--output", default="outputs/ddp_benchmark.csv")
+    args = parser.parse_args()
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    dist.init_process_group("nccl")
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+
+    dataset_name, dataset = build_dataset(args)
+    dataset_size = len(dataset)
+    model = DistributedDataParallel(
+        TokenWorkModel(args.compute_iters).to(device),
+        device_ids=[local_rank],
+    )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    rows: list[BenchmarkResult] = []
+
+    warning_context = warnings.catch_warnings()
+    with warning_context:
+        warnings.simplefilter("ignore")
+        for name in ("baseline", "lba"):
+            loader = build_loader(name, dataset, args)
+            result = run_loader(
+                name,
+                dataset_name,
+                dataset_size,
+                loader,
+                model,
+                optimizer,
+                device,
+                args,
+            )
+            if result is not None:
+                rows.append(result)
+
+    if dist.get_rank() == 0:
+        output_path = Path(args.output)
+        write_csv(output_path, rows)
+        print(json.dumps([asdict(row) for row in rows], indent=2))
+        print(f"wrote {output_path}")
+
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
