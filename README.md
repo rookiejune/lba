@@ -167,7 +167,7 @@ per-batch padding ratios:
 ```text
 LBA summary padding before_padding_ratio=... before_mean_batch_padding_ratio=... after_padding_ratio=... after_mean_batch_padding_ratio=... padding_ratio_reduction=...
 LBA summary lengths before_batches=... before_samples=... before_raw_length_sum=... before_padded_length_sum=... before_padding_length_sum=... after_batches=... after_samples=... after_raw_length_sum=... after_padded_length_sum=... after_padding_length_sum=...
-LBA summary planner planned_batches=... oversized_batches=... other_batches=... sort_time_seconds=... sort_calls=... average_sort_time_ms=... pop_ready_time_seconds=... pop_ready_calls=... average_pop_ready_time_ms=... candidate_window_checks=... average_candidate_window_checks=... max_candidate_window_checks=... fast_path_batches=... full_search_batches=... flush_search_batches=... planner_oversized_batches=... no_ready_calls=... records_sorted_total=... max_cache_size_seen=... spill_events=... spilled_records=...
+LBA summary planner planned_batches=... oversized_batches=... other_batches=... sort_time_seconds=... sort_calls=... average_sort_time_ms=... pop_ready_time_seconds=... pop_ready_calls=... average_pop_ready_time_ms=... candidate_window_checks=... average_candidate_window_checks=... max_candidate_window_checks=... fast_path_batches=... full_search_batches=... flush_search_batches=... fast_path_time_seconds=... full_search_time_seconds=... flush_search_time_seconds=... fast_path_candidate_window_checks=... full_search_candidate_window_checks=... flush_search_candidate_window_checks=... planner_oversized_batches=... no_ready_calls=... records_sorted_total=... max_cache_size_seen=... spill_events=... spilled_records=...
 ```
 
 Definitions:
@@ -180,6 +180,8 @@ Definitions:
 - `pop_ready_*` and `candidate_window_checks` measure planner search work.
 - `fast_path_batches`, `full_search_batches`, `flush_search_batches`, and
   `planner_oversized_batches` split batches by the planner path that emitted them.
+- `*_time_seconds` and `*_candidate_window_checks` fields with a planner-path
+  prefix split the same search work by source.
 
 ## Development
 

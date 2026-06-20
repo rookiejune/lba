@@ -184,6 +184,38 @@ ratio 不超过 10%，就可能接受一个不是最低 padding 的窗口。
 DDP smoke 中总耗时主要由 68 个 simulated steps 决定；优化后步数、padding 和 final
 flush 对齐行为保持一致。
 
+## Range-min Candidate 回归
+
+2026-06-20 在 145 上继续对比 `~/repos/lba_planner_opt` 和
+`~/repos/lba_planner_rangemin`。后者在候选构造时用 arrival-id range-min 索引替代
+逐窗口扫描 `min(arrival_id)`。
+
+### 单进程 Wikitext
+
+| setting | code | batches | elapsed | loader wait | pop ready | padded length | padding ratio |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 20k, prefetch 0, no sim | recent-window | 696 | 20.61s | 20.61s | 20.04s | 1,827,083 | 3.5574% |
+| 20k, prefetch 0, no sim | range-min | 696 | 7.33s | 7.33s | 6.79s | 1,827,083 | 3.5574% |
+| 50k, prefetch 0, no sim | recent-window | 1,642 | 58.07s | 58.07s | 56.86s | 4,497,454 | 3.5991% |
+| 50k, prefetch 0, no sim | range-min | 1,642 | 18.90s | 18.90s | 17.67s | 4,497,454 | 3.5991% |
+| 20k, prefetch 4, sim 0.05s | recent-window | 696 | 35.37s | 0.20s | 21.31s | 1,827,083 | 3.5574% |
+| 20k, prefetch 4, sim 0.05s | range-min | 696 | 35.06s | 0.10s | 13.37s | 1,827,083 | 3.5574% |
+
+结论：
+
+- no-sim 20k 从 recent-window 的 20.61s 降到 7.33s，约 2.81x；50k 从
+  58.07s 降到 18.90s，约 3.07x。
+- 相比优化前最初版本，20k 从 29.89s 降到 7.33s，约 4.08x；50k 从 98.00s
+  降到 18.90s，约 5.18x。
+- padding 完全保持不变，说明 range-min 只优化候选构造成本，没有改变 batch
+  选择语义。
+- range-min 20k no-sim 的 source split：fast path 6.17s / 860,608 checks，
+  flush 0.61s / 149,566 checks。50k no-sim：fast path 16.93s /
+  2,316,862 checks，flush 0.74s / 175,033 checks。
+
+range-min 后，flush 已不是主要成本；下一步应优先减少 fast-path recent-window
+枚举的候选数量，例如按长度 bucket 或更窄的局部窗口索引。
+
 ## DDP 真实文本测试
 
 DDP benchmark 已支持 `text-file` 数据源，可以直接复用 145 上落盘的 Wikitext

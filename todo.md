@@ -16,9 +16,8 @@
 
 ### 1. 继续降低候选搜索成本
 
-- 用 benchmark 观察 recent-window fast path 后的 `candidate_window_checks` 和
-  `pop_ready_time_seconds` 是否仍然过高。
-- 如果局部窗口仍不够，优先尝试按长度分桶或窗口索引，只在相近长度样本中找候选。
+- range-min 后主要成本在 fast-path recent-window 枚举，不在 tail flush。
+- 优先尝试按长度分桶或窗口索引，只在相近长度样本中找候选。
 - 维护增量候选状态：新增 records 后只更新受影响的 bucket/window。
 - 保留简单 fallback：当增量候选拿不到合适 batch 时，仍走一次完整搜索。
 

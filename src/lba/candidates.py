@@ -11,6 +11,54 @@ from typing import AbstractSet
 from .types import SampleRecord
 
 
+class ArrivalIdRangeMin:
+    """Range-min index for arrival ids in the current length-sorted pool."""
+
+    def __init__(self, arrival_ids: Sequence[int]) -> None:
+        if not arrival_ids:
+            raise ValueError("arrival_ids must not be empty.")
+
+        size = 1
+        while size < len(arrival_ids):
+            size *= 2
+
+        empty_value = max(arrival_ids) + 1
+        values = [empty_value] * (2 * size)
+        values[size : size + len(arrival_ids)] = arrival_ids
+        for index in range(size - 1, 0, -1):
+            values[index] = min(values[index * 2], values[index * 2 + 1])
+
+        self._length = len(arrival_ids)
+        self._size = size
+        self._values = values
+
+    @classmethod
+    def from_records(cls, records: Sequence[SampleRecord]) -> ArrivalIdRangeMin:
+        return cls([record.arrival_id for record in records])
+
+    def range_min(self, start_index: int, end_index: int) -> int:
+        if (
+            start_index < 0
+            or end_index < start_index
+            or end_index >= self._length
+        ):
+            raise ValueError("Invalid range-min query.")
+
+        left = start_index + self._size
+        right = end_index + self._size
+        best = self._values[left]
+        while left <= right:
+            if left % 2 == 1:
+                best = min(best, self._values[left])
+                left += 1
+            if right % 2 == 0:
+                best = min(best, self._values[right])
+                right -= 1
+            left //= 2
+            right //= 2
+        return best
+
+
 @dataclass(frozen=True)
 class BatchCandidate:
     """A contiguous length-sorted window that can become a dynamic batch."""
@@ -43,10 +91,13 @@ def find_threshold_candidate(
     max_padded_length: int,
     max_padding_ratio: float,
     recent_arrival_ids: AbstractSet[int],
+    arrival_id_range_min: ArrivalIdRangeMin | None = None,
 ) -> CandidateSearchResult:
     """Find the best candidate that satisfies the configured padding threshold."""
 
     sorted_lengths = [record.length for record in records]
+    if arrival_id_range_min is None and records:
+        arrival_id_range_min = ArrivalIdRangeMin.from_records(records)
     if recent_arrival_ids:
         recent_indices = recent_record_indices(records, recent_arrival_ids)
         candidates = iter_recent_batch_candidates(
@@ -56,6 +107,7 @@ def find_threshold_candidate(
             max_padding_ratio=max_padding_ratio,
             recent_indices=recent_indices,
             sorted_lengths=sorted_lengths,
+            arrival_id_range_min=arrival_id_range_min,
         )
     else:
         candidates = iter_batch_candidates(
@@ -64,6 +116,7 @@ def find_threshold_candidate(
             max_padded_length=max_padded_length,
             max_padding_ratio=max_padding_ratio,
             sorted_lengths=sorted_lengths,
+            arrival_id_range_min=arrival_id_range_min,
         )
 
     inspected_count = 0
@@ -86,16 +139,20 @@ def find_best_candidate(
     *,
     max_padded_length: int,
     max_padding_ratio: float,
+    arrival_id_range_min: ArrivalIdRangeMin | None = None,
 ) -> CandidateSearchResult:
     """Find the lowest-padding candidate when no threshold candidate is ready."""
 
     sorted_lengths = [record.length for record in records]
+    if arrival_id_range_min is None and records:
+        arrival_id_range_min = ArrivalIdRangeMin.from_records(records)
     candidates = iter_batch_candidates(
         records,
         prefix_lengths,
         max_padded_length=max_padded_length,
         max_padding_ratio=max_padding_ratio,
         sorted_lengths=sorted_lengths,
+        arrival_id_range_min=arrival_id_range_min,
     )
 
     inspected_count = 0
@@ -123,11 +180,14 @@ def iter_batch_candidates(
     max_padded_length: int,
     max_padding_ratio: float,
     sorted_lengths: Sequence[int] | None = None,
+    arrival_id_range_min: ArrivalIdRangeMin | None = None,
 ) -> Iterator[BatchCandidate]:
     """Yield candidate windows ending at each length-sorted record."""
 
     if sorted_lengths is None:
         sorted_lengths = [record.length for record in records]
+    if arrival_id_range_min is None and records:
+        arrival_id_range_min = ArrivalIdRangeMin.from_records(records)
     for end_index, longest_record in enumerate(records):
         if longest_record.length <= 0:
             continue
@@ -142,6 +202,7 @@ def iter_batch_candidates(
             prefix_lengths,
             widest_start_index,
             end_index,
+            arrival_id_range_min,
         )
 
         min_length_for_ratio = ceil(longest_record.length * (1 - max_padding_ratio))
@@ -157,6 +218,7 @@ def iter_batch_candidates(
                 prefix_lengths,
                 tight_start_index,
                 end_index,
+                arrival_id_range_min,
             )
 
 
@@ -168,11 +230,14 @@ def iter_recent_batch_candidates(
     max_padding_ratio: float,
     recent_indices: Sequence[int],
     sorted_lengths: Sequence[int] | None = None,
+    arrival_id_range_min: ArrivalIdRangeMin | None = None,
 ) -> Iterator[BatchCandidate]:
     """Yield candidate windows that contain at least one recent record."""
 
     if sorted_lengths is None:
         sorted_lengths = [record.length for record in records]
+    if arrival_id_range_min is None and records:
+        arrival_id_range_min = ArrivalIdRangeMin.from_records(records)
 
     seen_windows: set[tuple[int, int]] = set()
     for recent_index in recent_indices:
@@ -196,6 +261,7 @@ def iter_recent_batch_candidates(
                 end_index,
                 recent_index,
                 seen_windows,
+                arrival_id_range_min,
             )
 
             min_length_for_ratio = ceil(longest_record.length * (1 - max_padding_ratio))
@@ -213,6 +279,7 @@ def iter_recent_batch_candidates(
                     end_index,
                     recent_index,
                     seen_windows,
+                    arrival_id_range_min,
                 )
 
 
@@ -223,6 +290,7 @@ def _yield_recent_candidate_once(
     end_index: int,
     recent_index: int,
     seen_windows: set[tuple[int, int]],
+    arrival_id_range_min: ArrivalIdRangeMin | None,
 ) -> Iterator[BatchCandidate]:
     if not start_index <= recent_index <= end_index:
         return
@@ -232,7 +300,13 @@ def _yield_recent_candidate_once(
         return
 
     seen_windows.add(window_key)
-    yield make_batch_candidate(records, prefix_lengths, start_index, end_index)
+    yield make_batch_candidate(
+        records,
+        prefix_lengths,
+        start_index,
+        end_index,
+        arrival_id_range_min,
+    )
 
 
 def make_batch_candidate(
@@ -240,7 +314,11 @@ def make_batch_candidate(
     prefix_lengths: Sequence[int],
     start_index: int,
     end_index: int,
+    arrival_id_range_min: ArrivalIdRangeMin | None = None,
 ) -> BatchCandidate:
+    if arrival_id_range_min is None:
+        arrival_id_range_min = ArrivalIdRangeMin.from_records(records)
+
     total_raw_length = prefix_lengths[end_index + 1] - prefix_lengths[start_index]
     longest_length = records[end_index].length
     record_count = end_index - start_index + 1
@@ -256,9 +334,7 @@ def make_batch_candidate(
         total_padded_length=total_padded_length,
         total_padding_length=total_padding_length,
         padding_ratio=padding_ratio,
-        earliest_arrival_id=min(
-            records[index].arrival_id for index in range(start_index, end_index + 1)
-        ),
+        earliest_arrival_id=arrival_id_range_min.range_min(start_index, end_index),
     )
 
 

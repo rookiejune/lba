@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .candidates import (
+    ArrivalIdRangeMin,
     BatchCandidate,
     CandidateSearchResult,
     find_best_candidate,
@@ -46,7 +47,8 @@ class BatchPlanner:
 
         self._sorted_records: list[SampleRecord] = []
         self._prefix_lengths: list[int] = [0]
-        self._prefix_needs_refresh = False
+        self._arrival_id_range_min: ArrivalIdRangeMin | None = None
+        self._candidate_indexes_need_refresh = False
         self._recent_arrival_ids: set[int] = set()
 
     def add_records(self, records: Iterable[SampleRecord], *, allow_spill: bool = True) -> None:
@@ -61,7 +63,7 @@ class BatchPlanner:
             sorted_record_count=len(self._sorted_records),
             elapsed_seconds=time.perf_counter() - sort_started_at,
         )
-        self._prefix_needs_refresh = True
+        self._candidate_indexes_need_refresh = True
         self._recent_arrival_ids = {record.arrival_id for record in new_records}
 
         if allow_spill:
@@ -129,7 +131,8 @@ class BatchPlanner:
         records = list(self._sorted_records)
         self._sorted_records = []
         self._prefix_lengths = [0]
-        self._prefix_needs_refresh = False
+        self._arrival_id_range_min = None
+        self._candidate_indexes_need_refresh = False
         self._recent_arrival_ids.clear()
 
         for shard in self.spill_store.drain_shards():
@@ -151,23 +154,29 @@ class BatchPlanner:
     def _find_threshold_candidate(
         self, *, ignore_recent: bool
     ) -> CandidateSearchResult:
-        self._ensure_prefix_lengths()
+        self._ensure_candidate_indexes()
         recent_arrival_ids = frozenset() if ignore_recent else self._recent_arrival_ids
+        if self._arrival_id_range_min is None:
+            raise RuntimeError("Planner candidate indexes are not initialized.")
         return find_threshold_candidate(
             self._sorted_records,
             self._prefix_lengths,
             max_padded_length=self.max_padded_length,
             max_padding_ratio=self.max_padding_ratio,
             recent_arrival_ids=recent_arrival_ids,
+            arrival_id_range_min=self._arrival_id_range_min,
         )
 
     def _find_best_candidate(self) -> CandidateSearchResult:
-        self._ensure_prefix_lengths()
+        self._ensure_candidate_indexes()
+        if self._arrival_id_range_min is None:
+            raise RuntimeError("Planner candidate indexes are not initialized.")
         return find_best_candidate(
             self._sorted_records,
             self._prefix_lengths,
             max_padded_length=self.max_padded_length,
             max_padding_ratio=self.max_padding_ratio,
+            arrival_id_range_min=self._arrival_id_range_min,
         )
 
     def _remove_candidate(self, candidate: BatchCandidate, *, reason: str) -> BatchPlan:
@@ -202,7 +211,7 @@ class BatchPlanner:
             for record in self._sorted_records
             if record.arrival_id not in record_ids_to_remove
         ]
-        self._prefix_needs_refresh = True
+        self._candidate_indexes_need_refresh = True
         self._recent_arrival_ids.difference_update(record_ids_to_remove)
 
         if raw_length_sum is None:
@@ -242,16 +251,22 @@ class BatchPlanner:
             for record in self._sorted_records
             if record.arrival_id not in spilled_arrival_ids
         ]
-        self._prefix_needs_refresh = True
+        self._candidate_indexes_need_refresh = True
         self._recent_arrival_ids.difference_update(spilled_arrival_ids)
         if self.logger is not None:
             self.logger.info("spilled %s records to disk", len(spill_records))
 
-    def _ensure_prefix_lengths(self) -> None:
-        if not self._prefix_needs_refresh:
+    def _ensure_candidate_indexes(self) -> None:
+        if not self._candidate_indexes_need_refresh:
             return
+
         prefix_lengths = [0]
         for record in self._sorted_records:
             prefix_lengths.append(prefix_lengths[-1] + record.length)
         self._prefix_lengths = prefix_lengths
-        self._prefix_needs_refresh = False
+        self._arrival_id_range_min = (
+            ArrivalIdRangeMin.from_records(self._sorted_records)
+            if self._sorted_records
+            else None
+        )
+        self._candidate_indexes_need_refresh = False

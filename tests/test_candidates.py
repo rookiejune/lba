@@ -1,6 +1,7 @@
 import unittest
 
 from lba.candidates import (
+    ArrivalIdRangeMin,
     best_candidate_key,
     find_best_candidate,
     find_threshold_candidate,
@@ -18,6 +19,21 @@ def prefix_lengths(records: list[SampleRecord]) -> list[int]:
 
 
 class CandidateSearchTest(unittest.TestCase):
+    def test_arrival_id_range_min_queries_windows(self) -> None:
+        records = [
+            SampleRecord("a", 2, 20),
+            SampleRecord("b", 3, 10),
+            SampleRecord("c", 5, 30),
+            SampleRecord("d", 8, 5),
+        ]
+        range_min = ArrivalIdRangeMin.from_records(records)
+
+        self.assertEqual(range_min.range_min(0, 0), 20)
+        self.assertEqual(range_min.range_min(0, 2), 10)
+        self.assertEqual(range_min.range_min(2, 3), 5)
+        with self.assertRaises(ValueError):
+            range_min.range_min(2, 4)
+
     def test_recent_threshold_search_matches_full_recent_filter(self) -> None:
         records = [
             SampleRecord("a", 1, 0),

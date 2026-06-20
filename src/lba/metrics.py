@@ -123,6 +123,14 @@ class PlannerStats:
     flush_search_batch_count: int = 0
     oversized_batch_count: int = 0
     no_ready_call_count: int = 0
+    fast_path_time_seconds: float = 0.0
+    full_search_time_seconds: float = 0.0
+    flush_search_time_seconds: float = 0.0
+    oversized_time_seconds: float = 0.0
+    no_ready_time_seconds: float = 0.0
+    fast_path_candidate_window_checks: int = 0
+    full_search_candidate_window_checks: int = 0
+    flush_search_candidate_window_checks: int = 0
 
     def record_sort(self, *, sorted_record_count: int, elapsed_seconds: float) -> None:
         self.sort_call_count += 1
@@ -157,14 +165,22 @@ class PlannerStats:
 
         if source == "fast_path":
             self.fast_path_batch_count += 1
+            self.fast_path_time_seconds += elapsed_seconds
+            self.fast_path_candidate_window_checks += candidate_window_checks
         elif source == "full_search":
             self.full_search_batch_count += 1
+            self.full_search_time_seconds += elapsed_seconds
+            self.full_search_candidate_window_checks += candidate_window_checks
         elif source == "flush_search":
             self.flush_search_batch_count += 1
+            self.flush_search_time_seconds += elapsed_seconds
+            self.flush_search_candidate_window_checks += candidate_window_checks
         elif source == "oversized":
             self.oversized_batch_count += 1
+            self.oversized_time_seconds += elapsed_seconds
         elif source == "no_ready":
             self.no_ready_call_count += 1
+            self.no_ready_time_seconds += elapsed_seconds
         else:
             raise ValueError(f"Unknown pop_ready source: {source}")
 

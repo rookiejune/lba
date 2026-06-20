@@ -151,6 +151,8 @@ class WrapperSkeletonTest(unittest.TestCase):
         self.assertIn("pop_ready_time_seconds=", log_text)
         self.assertIn("candidate_window_checks=", log_text)
         self.assertIn("fast_path_batches=", log_text)
+        self.assertIn("fast_path_time_seconds=", log_text)
+        self.assertIn("fast_path_candidate_window_checks=", log_text)
 
     def test_rejects_negative_prefetch_batches(self) -> None:
         with self.assertRaises(ValueError), tempfile.TemporaryDirectory() as tmpdir:

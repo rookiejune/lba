@@ -435,6 +435,30 @@ class LengthBatchingAdapter:
                 ("full_search_batches", planner_stats.full_search_batch_count),
                 ("flush_search_batches", planner_stats.flush_search_batch_count),
                 (
+                    "fast_path_time_seconds",
+                    f"{planner_stats.fast_path_time_seconds:.6f}",
+                ),
+                (
+                    "full_search_time_seconds",
+                    f"{planner_stats.full_search_time_seconds:.6f}",
+                ),
+                (
+                    "flush_search_time_seconds",
+                    f"{planner_stats.flush_search_time_seconds:.6f}",
+                ),
+                (
+                    "fast_path_candidate_window_checks",
+                    planner_stats.fast_path_candidate_window_checks,
+                ),
+                (
+                    "full_search_candidate_window_checks",
+                    planner_stats.full_search_candidate_window_checks,
+                ),
+                (
+                    "flush_search_candidate_window_checks",
+                    planner_stats.flush_search_candidate_window_checks,
+                ),
+                (
                     "planner_oversized_batches",
                     planner_stats.oversized_batch_count,
                 ),
