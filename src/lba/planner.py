@@ -35,6 +35,7 @@ class BatchPlanner:
         max_padding_ratio: float = 0.05,
         spill_dir: str | Path | None = None,
         logger: Any | None = None,
+        event_writer: Any | None = None,
     ) -> None:
         if max_padded_length <= 0:
             raise ValueError("max_padded_length must be a positive integer.")
@@ -48,6 +49,7 @@ class BatchPlanner:
         self.max_padding_ratio = max_padding_ratio
         self.spill_store = SpillStore(spill_dir)
         self.logger = logger
+        self.event_writer = event_writer
         self.stats = PlannerStats()
 
         self._sorted_records: list[SampleRecord] = []
@@ -265,7 +267,22 @@ class BatchPlanner:
         self._candidate_indexes_need_refresh = True
         self._recent_arrival_ids.difference_update(spilled_arrival_ids)
         if self.logger is not None:
-            self.logger.info("spilled %s records to disk", len(spill_records))
+            self.logger.warning(
+                "lba health: spilled records=%s cache_limit=%s spill_dir=%s "
+                "action=increase max_cache_samples or set a faster spill_dir",
+                len(spill_records),
+                self.max_cache_samples,
+                self.spill_store.root,
+            )
+        if self.event_writer is not None:
+            self.event_writer.write(
+                "spill",
+                {
+                    "records": len(spill_records),
+                    "max_cache_samples": self.max_cache_samples,
+                    "spill_dir": str(self.spill_store.root),
+                },
+            )
 
     def _ensure_candidate_indexes(self) -> None:
         if not self._candidate_indexes_need_refresh:

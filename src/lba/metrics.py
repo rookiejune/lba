@@ -202,6 +202,10 @@ class PlannerStats:
             return None
         return self.candidate_window_checks / self.pop_ready_call_count
 
+    @property
+    def planner_time_seconds(self) -> float:
+        return self.sort_time_seconds + self.pop_ready_time_seconds
+
 
 def padding_ratio_reduction(before: PaddingStats, after: PaddingStats) -> float | None:
     before_ratio = before.global_padding_ratio

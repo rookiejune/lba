@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from .config import DEFAULT_PREFETCH_BATCHES, LBAConfig
 from .distributed import DistributedBatchCoordinator
 from .estimator import LengthBudgetResolver
-from .logging_utils import create_run_logger
+from .logging_utils import JsonlEventWriter, create_run_logger, event_log_path_for
 from .metrics import PaddingStats, PlannerStats, padding_ratio_reduction
 from .planner import BatchPlanner
 from .prefetch import prefetch_iterator
@@ -54,22 +54,50 @@ class LengthBatchingAdapter:
             log_dir=log_dir,
         )
         self.logger, self.log_path = create_run_logger(log_dir)
+        self.log_event_path = event_log_path_for(self.log_path)
+        self.event_writer = JsonlEventWriter(self.log_event_path)
         self._distributed = DistributedBatchCoordinator(
             dataloader,
             self.config,
             self.logger,
+            self.event_writer,
         )
         self._active_max_padded_length: int | None = None
         self.last_planner_stats = PlannerStats()
 
-        warnings.warn(f"LBA log file: {self.log_path}", stacklevel=2)
-        self.logger.info("LBA log file: %s", self.log_path)
+        warnings.warn(
+            f"LBA log file: {self.log_path}; structured events: {self.log_event_path}",
+            stacklevel=2,
+        )
+        self.logger.info(
+            "lba run: log=%s events=%s",
+            self.log_path,
+            self.log_event_path,
+        )
+        self.event_writer.write(
+            "run_start",
+            {
+                "log_path": str(self.log_path),
+                "event_path": str(self.log_event_path),
+                "config": self._config_event_fields(),
+            },
+        )
         if max_padded_length is not None:
             warnings.warn(
                 "max_padded_length is set explicitly and overrides warmup inference.",
                 stacklevel=2,
             )
-            self.logger.warning("explicit max_padded_length=%s", max_padded_length)
+            self.logger.warning(
+                "lba config: explicit max_padded_length=%s overrides warmup inference",
+                max_padded_length,
+            )
+            self.event_writer.write(
+                "config_warning",
+                {
+                    "reason": "explicit_max_padded_length",
+                    "max_padded_length": max_padded_length,
+                },
+            )
 
     @property
     def max_padded_length(self) -> int | None:
@@ -176,6 +204,7 @@ class LengthBatchingAdapter:
             max_padding_ratio=self.config.max_padding_ratio,
             spill_dir=self._distributed.spill_dir_for_rank(),
             logger=self.logger,
+            event_writer=self.event_writer,
         )
 
     def _iter_plans(
@@ -339,16 +368,30 @@ class LengthBatchingAdapter:
         if plan.reason == "oversized":
             oversized_sample = plan.records[0].sample
             active_max_padded_length = self._active_max_padded_length
+            sample_index = plan.records[0].index
+            sample_type = type(oversized_sample).__name__
             warnings.warn(
                 f"LBA oversized sample length={plan.records[0].length} "
-                f"max_padded_length={active_max_padded_length}: {oversized_sample!r}",
+                f"max_padded_length={active_max_padded_length} "
+                "was emitted as a singleton batch.",
                 stacklevel=2,
             )
             self.logger.warning(
-                "oversized sample length=%s max_padded_length=%s sample=%r",
+                "lba health: oversized sample length=%s budget=%s index=%s "
+                "sample_type=%s action=emitted_singleton",
                 plan.records[0].length,
                 active_max_padded_length,
-                oversized_sample,
+                self._format_optional(sample_index),
+                sample_type,
+            )
+            self.event_writer.write(
+                "oversized_sample",
+                {
+                    "length": plan.records[0].length,
+                    "max_padded_length": active_max_padded_length,
+                    "index": sample_index,
+                    "sample_type": sample_type,
+                },
             )
         return self.original_collate_fn(plan.samples)
 
@@ -359,150 +402,179 @@ class LengthBatchingAdapter:
         planner_stats: PlannerStats,
     ) -> None:
         reduction = padding_ratio_reduction(before_padding_stats, after_padding_stats)
-        self._log_summary_section(
-            "padding",
-            (
-                (
-                    "before_padding_ratio",
-                    self._format_ratio(before_padding_stats.global_padding_ratio),
-                ),
-                (
-                    "before_mean_batch_padding_ratio",
-                    self._format_ratio(before_padding_stats.mean_batch_padding_ratio),
-                ),
-                (
-                    "after_padding_ratio",
-                    self._format_ratio(after_padding_stats.global_padding_ratio),
-                ),
-                (
-                    "after_mean_batch_padding_ratio",
-                    self._format_ratio(after_padding_stats.mean_batch_padding_ratio),
-                ),
-                ("padding_ratio_reduction", self._format_percent(reduction)),
-            ),
+        saved_padding_length = (
+            before_padding_stats.padding_length_sum
+            - after_padding_stats.padding_length_sum
         )
-        self._log_summary_section(
-            "lengths",
-            (
-                ("before_batches", before_padding_stats.batch_count),
-                ("before_samples", before_padding_stats.sample_count),
-                ("before_raw_length_sum", before_padding_stats.raw_length_sum),
-                ("before_padded_length_sum", before_padding_stats.padded_length_sum),
-                ("before_padding_length_sum", before_padding_stats.padding_length_sum),
-                ("after_batches", after_padding_stats.batch_count),
-                ("after_samples", after_padding_stats.sample_count),
-                ("after_raw_length_sum", after_padding_stats.raw_length_sum),
-                ("after_padded_length_sum", after_padding_stats.padded_length_sum),
-                ("after_padding_length_sum", after_padding_stats.padding_length_sum),
-            ),
+        self.logger.info(
+            "lba summary: padding %s -> %s (%s reduction) saved_padding=%s "
+            "batches=%s->%s samples=%s",
+            self._format_percent_value(before_padding_stats.global_padding_ratio),
+            self._format_percent_value(after_padding_stats.global_padding_ratio),
+            self._format_percent_value(reduction),
+            self._format_signed_int(saved_padding_length),
+            before_padding_stats.batch_count,
+            after_padding_stats.batch_count,
+            after_padding_stats.sample_count,
         )
-        self._log_summary_section(
-            "planner",
-            (
-                ("planned_batches", after_padding_stats.planned_batch_count),
-                ("oversized_batches", after_padding_stats.oversized_batch_count),
-                ("other_batches", after_padding_stats.other_batch_count),
-                ("sort_time_seconds", f"{planner_stats.sort_time_seconds:.6f}"),
-                ("sort_calls", planner_stats.sort_call_count),
-                (
-                    "average_sort_time_ms",
-                    self._format_milliseconds(planner_stats.average_sort_time_ms),
-                ),
-                (
-                    "pop_ready_time_seconds",
-                    f"{planner_stats.pop_ready_time_seconds:.6f}",
-                ),
-                ("pop_ready_calls", planner_stats.pop_ready_call_count),
-                (
-                    "average_pop_ready_time_ms",
-                    self._format_milliseconds(
-                        planner_stats.average_pop_ready_time_ms
+        self.logger.info(
+            "lba planner: total=%s pop_ready_avg=%sms sort_avg=%sms "
+            "paths=fast:%s/full:%s/flush:%s max_cache=%s",
+            self._format_seconds(planner_stats.planner_time_seconds),
+            self._format_milliseconds(planner_stats.average_pop_ready_time_ms),
+            self._format_milliseconds(planner_stats.average_sort_time_ms),
+            planner_stats.fast_path_batch_count,
+            planner_stats.full_search_batch_count,
+            planner_stats.flush_search_batch_count,
+            planner_stats.max_cache_size_seen,
+        )
+        self.logger.info(
+            "lba health: oversized=%s spill_events=%s spilled_records=%s "
+            "no_ready=%s other_batches=%s event_log=%s",
+            after_padding_stats.oversized_batch_count,
+            planner_stats.spill_event_count,
+            planner_stats.spilled_record_count,
+            planner_stats.no_ready_call_count,
+            after_padding_stats.other_batch_count,
+            self.log_event_path,
+        )
+        self.event_writer.write(
+            "summary",
+            {
+                "max_padded_length": self._active_max_padded_length,
+                "padding": {
+                    "before": self._padding_event_fields(before_padding_stats),
+                    "after": self._padding_event_fields(after_padding_stats),
+                    "padding_ratio_reduction": reduction,
+                    "saved_padding_length": saved_padding_length,
+                    "saved_padded_length": (
+                        before_padding_stats.padded_length_sum
+                        - after_padding_stats.padded_length_sum
                     ),
-                ),
-                (
-                    "candidate_window_checks",
-                    planner_stats.candidate_window_checks,
-                ),
-                (
-                    "average_candidate_window_checks",
-                    self._format_float(
-                        planner_stats.average_candidate_window_checks
-                    ),
-                ),
-                (
-                    "max_candidate_window_checks",
-                    planner_stats.max_candidate_window_checks,
-                ),
-                ("fast_path_batches", planner_stats.fast_path_batch_count),
-                ("full_search_batches", planner_stats.full_search_batch_count),
-                ("flush_search_batches", planner_stats.flush_search_batch_count),
-                (
-                    "fast_path_time_seconds",
-                    f"{planner_stats.fast_path_time_seconds:.6f}",
-                ),
-                (
-                    "full_search_time_seconds",
-                    f"{planner_stats.full_search_time_seconds:.6f}",
-                ),
-                (
-                    "flush_search_time_seconds",
-                    f"{planner_stats.flush_search_time_seconds:.6f}",
-                ),
-                (
-                    "fast_path_candidate_window_checks",
-                    planner_stats.fast_path_candidate_window_checks,
-                ),
-                (
-                    "full_search_candidate_window_checks",
-                    planner_stats.full_search_candidate_window_checks,
-                ),
-                (
-                    "flush_search_candidate_window_checks",
-                    planner_stats.flush_search_candidate_window_checks,
-                ),
-                (
-                    "planner_oversized_batches",
-                    planner_stats.oversized_batch_count,
-                ),
-                ("no_ready_calls", planner_stats.no_ready_call_count),
-                ("records_sorted_total", planner_stats.records_sorted_total),
-                ("max_cache_size_seen", planner_stats.max_cache_size_seen),
-                ("spill_events", planner_stats.spill_event_count),
-                ("spilled_records", planner_stats.spilled_record_count),
-            ),
+                },
+                "planner": self._planner_event_fields(planner_stats),
+                "health": {
+                    "oversized_batches": after_padding_stats.oversized_batch_count,
+                    "planner_oversized_batches": planner_stats.oversized_batch_count,
+                    "other_batches": after_padding_stats.other_batch_count,
+                    "spill_events": planner_stats.spill_event_count,
+                    "spilled_records": planner_stats.spilled_record_count,
+                    "no_ready_calls": planner_stats.no_ready_call_count,
+                },
+            },
         )
 
-    def _log_summary_section(
-        self, section: str, fields: Iterable[tuple[str, object]]
-    ) -> None:
-        self.logger.info("LBA summary %s %s", section, self._format_fields(fields))
+    def _config_event_fields(self) -> dict[str, object]:
+        return {
+            "max_padded_length": self.config.max_padded_length,
+            "warmup_batches": self.config.warmup_batches,
+            "max_cache_samples": self.config.max_cache_samples,
+            "max_padding_ratio": self.config.max_padding_ratio,
+            "prefetch_batches": self.config.prefetch_batches,
+            "drop_last_flush": self.config.drop_last_flush,
+            "spill_dir": self._path_or_none(self.config.spill_dir),
+            "log_dir": self._path_or_none(self.config.log_dir),
+        }
+
+    def _padding_event_fields(self, stats: PaddingStats) -> dict[str, object]:
+        return {
+            "batch_count": stats.batch_count,
+            "sample_count": stats.sample_count,
+            "raw_length_sum": stats.raw_length_sum,
+            "padded_length_sum": stats.padded_length_sum,
+            "padding_length_sum": stats.padding_length_sum,
+            "padding_ratio": stats.global_padding_ratio,
+            "mean_batch_padding_ratio": stats.mean_batch_padding_ratio,
+            "planned_batch_count": stats.planned_batch_count,
+            "oversized_batch_count": stats.oversized_batch_count,
+            "other_batch_count": stats.other_batch_count,
+        }
+
+    def _planner_event_fields(self, stats: PlannerStats) -> dict[str, object]:
+        return {
+            "planner_time_seconds": stats.planner_time_seconds,
+            "sort_time_seconds": stats.sort_time_seconds,
+            "sort_calls": stats.sort_call_count,
+            "average_sort_time_ms": stats.average_sort_time_ms,
+            "pop_ready_time_seconds": stats.pop_ready_time_seconds,
+            "pop_ready_calls": stats.pop_ready_call_count,
+            "average_pop_ready_time_ms": stats.average_pop_ready_time_ms,
+            "candidate_window_checks": stats.candidate_window_checks,
+            "average_candidate_window_checks": (
+                stats.average_candidate_window_checks
+            ),
+            "max_candidate_window_checks": stats.max_candidate_window_checks,
+            "records_sorted_total": stats.records_sorted_total,
+            "max_cache_size_seen": stats.max_cache_size_seen,
+            "spill_events": stats.spill_event_count,
+            "spilled_records": stats.spilled_record_count,
+            "paths": {
+                "fast_path": {
+                    "batches": stats.fast_path_batch_count,
+                    "time_seconds": stats.fast_path_time_seconds,
+                    "candidate_window_checks": (
+                        stats.fast_path_candidate_window_checks
+                    ),
+                },
+                "full_search": {
+                    "batches": stats.full_search_batch_count,
+                    "time_seconds": stats.full_search_time_seconds,
+                    "candidate_window_checks": (
+                        stats.full_search_candidate_window_checks
+                    ),
+                },
+                "flush_search": {
+                    "batches": stats.flush_search_batch_count,
+                    "time_seconds": stats.flush_search_time_seconds,
+                    "candidate_window_checks": (
+                        stats.flush_search_candidate_window_checks
+                    ),
+                },
+                "oversized": {
+                    "batches": stats.oversized_batch_count,
+                    "time_seconds": stats.oversized_time_seconds,
+                },
+                "no_ready": {
+                    "calls": stats.no_ready_call_count,
+                    "time_seconds": stats.no_ready_time_seconds,
+                },
+            },
+        }
 
     @staticmethod
-    def _format_fields(fields: Iterable[tuple[str, object]]) -> str:
-        return " ".join(f"{key}={value}" for key, value in fields)
-
-    @staticmethod
-    def _format_ratio(value: float | None) -> str:
-        if value is None:
-            return "n/a"
-        return f"{value:.4f}"
-
-    @staticmethod
-    def _format_percent(value: float | None) -> str:
+    def _format_percent_value(value: float | None) -> str:
         if value is None:
             return "n/a"
         return f"{value * 100:.2f}%"
+
+    @staticmethod
+    def _format_seconds(value: float) -> str:
+        if value < 1:
+            return f"{value * 1000:.3f}ms"
+        return f"{value:.3f}s"
+
+    @staticmethod
+    def _format_signed_int(value: int) -> str:
+        if value > 0:
+            return f"+{value}"
+        return str(value)
+
+    @staticmethod
+    def _format_optional(value: object | None) -> str:
+        if value is None:
+            return "n/a"
+        return str(value)
+
+    @staticmethod
+    def _path_or_none(value: str | Path | None) -> str | None:
+        if value is None:
+            return None
+        return str(value)
 
     @staticmethod
     def _format_milliseconds(value: float | None) -> str:
         if value is None:
             return "n/a"
         return f"{value:.3f}"
-
-    @staticmethod
-    def _format_float(value: float | None) -> str:
-        if value is None:
-            return "n/a"
-        return f"{value:.2f}"
 
 LBA = LengthBatchingAdapter

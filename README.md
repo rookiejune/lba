@@ -165,33 +165,38 @@ When `spill_dir` is configured under DDP, LBA writes each rank under a
 
 ## Logs
 
-Each adapter run creates a log file and emits a warning with its path:
+Each adapter run creates a human-readable log and a matching JSONL event file,
+then emits a warning with both paths:
 
 ```text
 ~/.lba/logs/lba-YYYYmmdd-HHMMSS-PID.log
+~/.lba/logs/lba-YYYYmmdd-HHMMSS-PID.jsonl
 ```
 
-The summary includes both global token-weighted padding ratios and the mean of
-per-batch padding ratios:
+The `.log` file is optimized for scanning during training:
 
 ```text
-LBA summary padding before_padding_ratio=... before_mean_batch_padding_ratio=... after_padding_ratio=... after_mean_batch_padding_ratio=... padding_ratio_reduction=...
-LBA summary lengths before_batches=... before_samples=... before_raw_length_sum=... before_padded_length_sum=... before_padding_length_sum=... after_batches=... after_samples=... after_raw_length_sum=... after_padded_length_sum=... after_padding_length_sum=...
-LBA summary planner planned_batches=... oversized_batches=... other_batches=... sort_time_seconds=... sort_calls=... average_sort_time_ms=... pop_ready_time_seconds=... pop_ready_calls=... average_pop_ready_time_ms=... candidate_window_checks=... average_candidate_window_checks=... max_candidate_window_checks=... fast_path_batches=... full_search_batches=... flush_search_batches=... fast_path_time_seconds=... full_search_time_seconds=... flush_search_time_seconds=... fast_path_candidate_window_checks=... full_search_candidate_window_checks=... flush_search_candidate_window_checks=... planner_oversized_batches=... no_ready_calls=... records_sorted_total=... max_cache_size_seen=... spill_events=... spilled_records=...
+2026-06-25 14:03:12 INFO lba summary: padding 82.10% -> 4.70% (94.28% reduction) saved_padding=+123456 batches=312->428 samples=9984
+2026-06-25 14:03:12 INFO lba planner: total=840.000ms pop_ready_avg=0.180ms sort_avg=1.200ms paths=fast:397/full:21/flush:10 max_cache=8192
+2026-06-25 14:03:12 INFO lba health: oversized=0 spill_events=0 spilled_records=0 no_ready=18 other_batches=0 event_log=...
 ```
 
-Definitions:
+The `.jsonl` file keeps the full structured details for benchmarks and
+regression checks. Important events include:
 
-- `before_*` describes the original `DataLoader` batches before LBA replans them.
-- `after_*` describes the dynamic batches emitted by LBA.
-- `padding_ratio` is `padding_length_sum / padded_length_sum`.
-- `mean_batch_padding_ratio` is the arithmetic mean of each batch's padding ratio.
-- `sort_time_seconds` measures time spent sorting the planner's in-memory pool.
-- `pop_ready_*` and `candidate_window_checks` measure planner search work.
-- `fast_path_batches`, `full_search_batches`, `flush_search_batches`, and
-  `planner_oversized_batches` split batches by the planner path that emitted them.
-- `*_time_seconds` and `*_candidate_window_checks` fields with a planner-path
-  prefix split the same search work by source.
+- `run_start`: resolved log paths and adapter configuration.
+- `summary`: before/after padding ratios, token sums, planner timings, path
+  counts, spill counters, and health counters.
+- `oversized_sample`: a sample exceeded `max_padded_length`; logs length,
+  budget, optional dataset index, and sample type without dumping the sample.
+- `spill`: planner cache overflow wrote records to disk.
+- `distributed_*`: DDP budget synchronization, final flush mode, and dropped
+  final flush records.
+
+In the summary event, `padding.before` describes the original `DataLoader`
+batches before LBA replans them, and `padding.after` describes emitted dynamic
+batches. `padding_ratio` is `padding_length_sum / padded_length_sum`;
+`mean_batch_padding_ratio` is the arithmetic mean of each batch's padding ratio.
 
 ## Development
 

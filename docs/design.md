@@ -122,3 +122,9 @@ DDP 模式下，如果用户传入共享 `spill_dir`，adapter 会在其下按 r
 ```text
 ~/.lba/logs/
 ```
+
+每次 adapter 运行写两份日志：
+
+- `.log`：给训练时人工扫读，固定输出 padding 改善、planner 开销和健康计数。
+- `.jsonl`：给 benchmark 和排障脚本解析，记录完整 summary、spill、oversized
+  sample、DDP final flush 等结构化事件。

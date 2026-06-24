@@ -6,6 +6,7 @@ import logging
 import warnings
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -23,11 +24,13 @@ class DistributedBatchCoordinator:
         self,
         dataloader: DataLoader,
         config: LBAConfig,
-        logger: logging.Logger,
+        logger: logging.Logger | None,
+        event_writer: Any | None = None,
     ) -> None:
         self.dataloader = dataloader
         self.config = config
         self.logger = logger
+        self.event_writer = event_writer
 
     @staticmethod
     def is_initialized() -> bool:
@@ -51,10 +54,25 @@ class DistributedBatchCoordinator:
                 "max_padded_length on every rank."
             )
         if self.config.max_padded_length is None and local_value != max_value:
-            self.logger.info(
-                "using distributed max_padded_length=%s from local_value=%s",
-                max_value,
-                local_value,
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            if self.logger is not None:
+                self.logger.info(
+                    "lba distributed: rank=%s/%s using shared max_padded_length=%s "
+                    "local_value=%s",
+                    rank,
+                    world_size,
+                    max_value,
+                    local_value,
+                )
+            self._write_event(
+                "distributed_max_padded_length",
+                {
+                    "rank": rank,
+                    "world_size": world_size,
+                    "local_value": local_value,
+                    "shared_value": max_value,
+                },
             )
         return max_value
 
@@ -62,8 +80,12 @@ class DistributedBatchCoordinator:
         self, local_records: list[SampleRecord], *, max_padded_length: int
     ) -> list[BatchPlan]:
         if self._all_ranks_have_record_indices(local_records):
-            return self._index_flush_plans(local_records, max_padded_length)
-        return self._object_flush_plans(local_records, max_padded_length)
+            plans = self._index_flush_plans(local_records, max_padded_length)
+            self._write_flush_event("index_metadata", local_records, plans)
+            return plans
+        plans = self._object_flush_plans(local_records, max_padded_length)
+        self._write_flush_event("object_gather", local_records, plans)
+        return plans
 
     def spill_dir_for_rank(self) -> Path | str | None:
         if self.config.spill_dir is None:
@@ -197,6 +219,7 @@ class DistributedBatchCoordinator:
             max_padding_ratio=self.config.max_padding_ratio,
             spill_dir=None,
             logger=self.logger,
+            event_writer=self.event_writer,
         )
         try:
             planner.add_records(records, allow_spill=False)
@@ -240,7 +263,19 @@ class DistributedBatchCoordinator:
             "form a non-empty batch on every rank."
         )
         warnings.warn(message, stacklevel=3)
-        self.logger.warning(message)
+        if self.logger is not None:
+            self.logger.warning(
+                "%s Set drop_last_flush=False to fail instead.",
+                message,
+            )
+        self._write_event(
+            "distributed_drop_last_flush",
+            {
+                "dropped_records": dropped_record_count,
+                "world_size": dist.get_world_size(),
+                "drop_last_flush": self.config.drop_last_flush,
+            },
+        )
 
     @staticmethod
     def _record_count(plans: Iterable[BatchPlan]) -> int:
@@ -324,6 +359,31 @@ class DistributedBatchCoordinator:
         dist.all_reduce(min_tensor, op=dist.ReduceOp.MIN)
         dist.all_reduce(max_tensor, op=dist.ReduceOp.MAX)
         return int(min_tensor.item()), int(max_tensor.item())
+
+    def _write_event(self, event: str, fields: dict[str, object]) -> None:
+        if self.event_writer is None:
+            return
+        self.event_writer.write(event, fields)
+
+    def _write_flush_event(
+        self,
+        mode: str,
+        local_records: list[SampleRecord],
+        plans: list[BatchPlan],
+    ) -> None:
+        if not self.is_initialized():
+            return
+        self._write_event(
+            "distributed_flush",
+            {
+                "mode": mode,
+                "rank": dist.get_rank(),
+                "world_size": dist.get_world_size(),
+                "local_records": len(local_records),
+                "assigned_batches": len(plans),
+                "assigned_records": self._record_count(plans),
+            },
+        )
 
     @staticmethod
     def _distributed_tensor_device() -> torch.device:

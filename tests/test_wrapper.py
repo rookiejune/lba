@@ -1,5 +1,6 @@
-import unittest
+import json
 import tempfile
+import unittest
 import warnings
 from pathlib import Path
 
@@ -125,7 +126,7 @@ class WrapperSkeletonTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "batched DataLoader"):
                 list(adapter)
 
-    def test_logs_padding_and_planner_summary(self) -> None:
+    def test_logs_human_summary_and_structured_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, warnings.catch_warnings():
             warnings.simplefilter("ignore")
             adapter = LBA(
@@ -141,18 +142,46 @@ class WrapperSkeletonTest(unittest.TestCase):
             )
             list(adapter)
             log_text = Path(adapter.log_path).read_text()
+            event_text = Path(adapter.log_event_path).read_text()
 
-        self.assertIn("LBA summary padding", log_text)
-        self.assertIn("before_padding_ratio=", log_text)
-        self.assertIn("after_padding_ratio=", log_text)
-        self.assertIn("padding_ratio_reduction=", log_text)
-        self.assertIn("LBA summary planner", log_text)
-        self.assertIn("sort_time_seconds=", log_text)
-        self.assertIn("pop_ready_time_seconds=", log_text)
-        self.assertIn("candidate_window_checks=", log_text)
-        self.assertIn("fast_path_batches=", log_text)
-        self.assertIn("fast_path_time_seconds=", log_text)
-        self.assertIn("fast_path_candidate_window_checks=", log_text)
+        self.assertIn("lba summary: padding", log_text)
+        self.assertIn("lba planner: total=", log_text)
+        self.assertIn("lba health: oversized=", log_text)
+        events = [json.loads(line) for line in event_text.splitlines()]
+        summary = next(event for event in events if event["event"] == "summary")
+        self.assertIn("padding_ratio_reduction", summary["padding"])
+        self.assertIn("before", summary["padding"])
+        self.assertIn("after", summary["padding"])
+        self.assertIn("candidate_window_checks", summary["planner"])
+        self.assertIn("paths", summary["planner"])
+
+    def test_oversized_log_omits_sample_repr(self) -> None:
+        oversized_sample = [0] * 20
+        with tempfile.TemporaryDirectory() as tmpdir, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            adapter = LBA(
+                DataLoader(
+                    [oversized_sample],
+                    batch_size=1,
+                    collate_fn=identity_collate,
+                ),
+                len_fn=len,
+                max_padded_length=10,
+                prefetch_batches=0,
+                log_dir=tmpdir,
+            )
+            list(adapter)
+            log_text = Path(adapter.log_path).read_text()
+            event_text = Path(adapter.log_event_path).read_text()
+
+        self.assertIn("lba health: oversized sample", log_text)
+        self.assertIn("sample_type=list", log_text)
+        self.assertNotIn(repr(oversized_sample), log_text)
+        events = [json.loads(line) for line in event_text.splitlines()]
+        oversized_event = next(
+            event for event in events if event["event"] == "oversized_sample"
+        )
+        self.assertEqual(oversized_event["length"], 20)
 
     def test_rejects_negative_prefetch_batches(self) -> None:
         with self.assertRaises(ValueError), tempfile.TemporaryDirectory() as tmpdir:

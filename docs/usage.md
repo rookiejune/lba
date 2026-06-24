@@ -55,10 +55,11 @@ loader = LBA(dataloader, len_fn=len_fn, max_padding_ratio=0.05)
 
 ## 日志路径
 
-默认日志目录设计为：
+默认每次运行会写一个人类可读日志和一个结构化事件文件：
 
 ```text
 ~/.lba/logs/lba-YYYYmmdd-HHMMSS-PID.log
+~/.lba/logs/lba-YYYYmmdd-HHMMSS-PID.jsonl
 ```
 
 用户也可以指定：
@@ -66,6 +67,10 @@ loader = LBA(dataloader, len_fn=len_fn, max_padding_ratio=0.05)
 ```python
 loader = LBA(dataloader, len_fn=len_fn, log_dir="outputs/lba_logs")
 ```
+
+`.log` 里默认只放训练时最需要扫的三类信息：padding 改善、planner 开销和健康
+计数。完整的 before/after 长度统计、planner path 拆分、spill、oversized 和 DDP
+事件写入同名 `.jsonl`，方便 benchmark 或回归脚本解析。
 
 ## 预取
 
