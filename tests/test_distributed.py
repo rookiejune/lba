@@ -187,6 +187,30 @@ class DistributedCoordinatorTest(unittest.TestCase):
         ):
             self.assertEqual(coordinator.spill_dir_for_rank(), "storage/spill")
 
+    def test_uses_gloo_metadata_group_with_nccl_default_group(self) -> None:
+        coordinator = DistributedBatchCoordinator(
+            dataloader=None,
+            config=LBAConfig(),
+            logger=None,
+        )
+        metadata_group = object()
+
+        with (
+            patch.object(DistributedBatchCoordinator, "is_initialized", return_value=True),
+            patch("lba.distributed.dist.get_backend", return_value="nccl"),
+            patch("lba.distributed.dist.is_gloo_available", return_value=True),
+            patch("lba.distributed.dist.new_group", return_value=metadata_group) as new_group,
+            patch("lba.distributed.dist.get_rank", return_value=0),
+            patch("lba.distributed.dist.get_world_size", return_value=1),
+        ):
+            self.assertIs(coordinator._metadata_process_group(), metadata_group)
+            self.assertEqual(
+                coordinator._distributed_tensor_device(metadata_group),
+                torch.device("cpu"),
+            )
+
+        new_group.assert_called_once_with(backend="gloo")
+
     def test_splits_local_plans_to_match_distributed_step_count(self) -> None:
         records = (
             SampleRecord("a", 1, 0),

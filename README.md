@@ -204,6 +204,13 @@ map-style datasets with `DistributedSampler`. Explicit `max_padded_length`
 values must match on every rank; inferred budgets are synchronized with the
 maximum inferred value.
 
+CUDA training should continue to initialize the default process group with
+NCCL. When LBA sees an NCCL default group, it creates a separate Gloo process
+group only for CPU-side metadata synchronization, including small integer
+reductions and final-flush object metadata. This keeps model gradient
+collectives on NCCL while avoiding unnecessary CUDA traffic for Python and
+batch-planning metadata.
+
 By default, `drop_last_flush=True` drops final flush samples that cannot form a
 non-empty DDP step on every rank, and LBA emits a warning with the dropped sample
 count. Set `drop_last_flush=False` to fail instead.
